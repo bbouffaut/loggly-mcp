@@ -1,0 +1,15 @@
+.git
+node_modules
+
+# macOS AppleDouble metadata files
+._*
+.DS_Store
+.gitignore
+.github
+examples
+scripts
+
+# Never bake secrets/personal config into the image; these are mounted at runtime.
+.env
+.env.*
+!.env.example
