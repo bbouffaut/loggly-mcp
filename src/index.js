@@ -2,6 +2,8 @@ import {
   McpServer,
   ResourceTemplate
 } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { createServer } from "node:http";
 import { ContentLengthStdioServerTransport } from "./contentLengthStdioTransport.js";
 import { z } from "zod";
 import { existsSync, readFileSync } from "node:fs";
@@ -109,7 +111,9 @@ const config = {
   authMode: (process.env.LOGGLY_AUTH_MODE || "bearer").toLowerCase(),
   maxRetries: parseNonNegativeInt(process.env.LOGGLY_MAX_RETRIES, 2),
   requestTimeoutMs: parseNonNegativeInt(process.env.LOGGLY_REQUEST_TIMEOUT_MS, 15000),
-  logLevel: normalizeLogLevel(process.env.LOGGLY_LOG_LEVEL || "info")
+  logLevel: normalizeLogLevel(process.env.LOGGLY_LOG_LEVEL || "info"),
+  transport: (process.env.LOGGLY_MCP_TRANSPORT || "stdio").toLowerCase(),
+  httpPort: parseNonNegativeInt(process.env.LOGGLY_MCP_PORT, 8000)
 };
 
 const SMOKE_TEST = process.env.LOGGLY_SMOKE_TEST === "1";
@@ -454,23 +458,6 @@ const RESOURCE_MIME_TYPE = "application/json";
 const toolRegistry = new Map();
 const SERVER_VERSION = "0.3.0";
 
-const server = new McpServer({
-  name: "loggly-api-mcp",
-  version: SERVER_VERSION
-});
-
-function registerToolWithResource(name, config, handler) {
-  toolRegistry.set(name, {
-    name,
-    title: config?.title || name,
-    description: config?.description || "",
-    inputSchema: config?.inputSchema || null,
-    handler
-  });
-
-  return server.registerTool(name, config, handler);
-}
-
 const RESOURCE_TEMPLATES = [
   {
     name: "tool",
@@ -488,6 +475,27 @@ const RESOURCE_TEMPLATES = [
     mimeType: RESOURCE_MIME_TYPE
   }
 ];
+
+// Each Streamable HTTP session gets its own McpServer instance (the SDK's
+// Protocol can only connect to one transport), so the whole registration
+// block lives in a factory.
+function buildMcpServer() {
+const server = new McpServer({
+  name: "loggly-api-mcp",
+  version: SERVER_VERSION
+});
+
+function registerToolWithResource(name, config, handler) {
+  toolRegistry.set(name, {
+    name,
+    title: config?.title || name,
+    description: config?.description || "",
+    inputSchema: config?.inputSchema || null,
+    handler
+  });
+
+  return server.registerTool(name, config, handler);
+}
 
 registerToolWithResource(
   "connection_test",
@@ -1045,6 +1053,9 @@ server.registerResource(
   }
 );
 
+return server;
+}
+
 function buildServerInfo() {
   return {
     name: "loggly-api-mcp",
@@ -1135,10 +1146,68 @@ function toReadResourceResult(uri, payload) {
   };
 }
 
-const transport = new ContentLengthStdioServerTransport();
 log("info", "Starting Loggly MCP server.", {
   version: SERVER_VERSION,
   configured: Boolean(config.subdomain) && Boolean(config.token),
-  subdomain: config.subdomain || null
+  subdomain: config.subdomain || null,
+  transport: config.transport
 });
-await server.connect(transport);
+
+if (config.transport === "http") {
+  // Streamable HTTP transport: long-lived server for Kubernetes/remote use.
+  // Each session gets its own transport + McpServer instance (stateful,
+  // session-id based), following the SDK's simpleStreamableHttp example.
+  const transports = new Map();
+
+  const httpServer = createServer(async (req, res) => {
+    const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+    if (url.pathname !== "/mcp") {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Not found. Use POST /mcp" }));
+      return;
+    }
+
+    const sessionId = req.headers["mcp-session-id"];
+    let transport = sessionId ? transports.get(sessionId) : undefined;
+
+    if (req.method === "DELETE") {
+      if (transport) {
+        await transport.close();
+        transports.delete(sessionId);
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+
+    if (!transport) {
+      transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () =>
+          crypto.randomUUID().replaceAll("-", "").slice(0, 32),
+        // The session ID is only assigned when the initialize request is
+        // handled, so register the transport in the map at that point.
+        onsessioninitialized: (sid) => {
+          transports.set(sid, transport);
+        }
+      });
+      transport.onclose = () => {
+        transports.delete(transport.sessionId);
+      };
+      const sessionServer = buildMcpServer();
+      await sessionServer.connect(transport);
+    }
+
+    await transport.handleRequest(req, res);
+  });
+
+  httpServer.listen(config.httpPort, () => {
+    log("info", "Loggly MCP server listening (Streamable HTTP).", {
+      port: config.httpPort,
+      endpoint: "/mcp"
+    });
+  });
+} else {
+  const transport = new ContentLengthStdioServerTransport();
+  const stdioServer = buildMcpServer();
+  await stdioServer.connect(transport);
+}
